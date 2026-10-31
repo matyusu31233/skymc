@@ -3,7 +3,7 @@ name: SkyMC 自动续期 (SeleniumBase UC)
 on:
   schedule:
     # 每30分跑一次
-    - cron: '*/30 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 jobs:
