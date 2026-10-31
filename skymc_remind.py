@@ -4,10 +4,10 @@ import os
 import requests
 from datetime import datetime, timezone, timedelta
 
-SERVER_NAME = "zdsa"
-SERVER_ID = "TuUzR_dWxO2P"
-SERVER_URL = "https://skymc.org/en/server/TuUzR_dWxO2P"
-SERVER_ADDRESS = "zdsa.skymc.io"
+SERVER_NAME = "bbc"
+SERVER_ID = "rUn5c1OR2aLr"
+SERVER_URL = "https://skymc.org/en/server/rUn5c1OR2aLr"
+SERVER_ADDRESS = "bbc.skymc.io"
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
