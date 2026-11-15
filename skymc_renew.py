@@ -1154,6 +1154,17 @@ def _run_attempt(sb, current_ip):
     handle_cloudflare(sb)
     wait_challenge_gone(sb, timeout=15)
     after = read_panel_info(sb)
+    # 续后回读重试：点 Renew 后会弹 Cloudflare 验证，弹窗消失后页面还要
+    # 重渲染，按钮文字可能几十秒内读不到；原逻辑只读一次就报「未读到」，
+    # 改为读不到时最多再重试 8 次、每次间隔 5 秒并顺手处理验证弹窗。
+    _reread_retry = 0
+    while not after.get("remaining") and _reread_retry < 8:
+        _reread_retry += 1
+        print(f"   续后时间未读到，第 {_reread_retry}/8 次重试回读...", flush=True)
+        time.sleep(5)
+        handle_cloudflare(sb)
+        wait_challenge_gone(sb, timeout=10)
+        after = read_panel_info(sb)
     after_time = after.get("remaining")
     print(f"⏱ 续期后剩余时间: {format_remaining(after_time)}", flush=True)
 
