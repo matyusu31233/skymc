@@ -38,6 +38,39 @@ _SINGBOX_PROC = None
 # 全局激活防重入状态锁
 _ACTIVATED_ATTEMPTED = False
 
+# WebDriver/Chrome 进程死亡时的专用异常：由 main 捕获后销毁旧会话、
+# 用全新 SB 会话重新登录重试，而不是在已死的 driver 上反复操作。
+MAX_SESSION_ATTEMPTS = 3
+
+
+class DriverDeadError(Exception):
+    """WebDriver 连接已断开（chromedriver/Chrome 进程已死亡）。"""
+
+
+def _looks_like_driver_dead(exc):
+    """判断异常链是否呈现 WebDriver 连接死亡的特征
+    （如访问 driver.window_handles 时 localhost 端口 Connection refused）。"""
+    markers = (
+        "connection refused",
+        "failed to establish a new connection",
+        "max retries exceeded",
+        "invalid session id",
+        "session deleted",
+        "chrome not reachable",
+        "no such window",
+        "target window already closed",
+        "disconnected",
+    )
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur).lower()
+        if any(m in text for m in markers):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
 EMAIL_SELECTORS = [
     "#usernameOrEmail-s1",
     'input[name="identifier"]',
@@ -601,10 +634,26 @@ def reconnect_driver(sb, url=None):
 
 def open_server_panel(sb):
     print("📄 进入服务器面板...", flush=True)
+    # 先确认 driver 还活着：已死则直接抛 DriverDeadError，
+    # 交给 main 用全新会话重试，不要在死 driver 上反复尝试。
+    if not driver_is_alive(sb):
+        raise DriverDeadError("进入服务器面板前 WebDriver 已断开")
+
+    # 优先普通导航：登录时已通过 Cloudflare，面板页通常不需要 UC 重连；
+    # 且 uc_open_with_reconnect 在 driver 死亡时访问 window_handles 会直接抛错。
     try:
-        sb.uc_open_with_reconnect(SERVER_URL, reconnect_time=5)
-    except Exception:
         sb.open(SERVER_URL)
+    except Exception as e:
+        if not driver_is_alive(sb) or _looks_like_driver_dead(e):
+            raise DriverDeadError(f"打开服务器面板时 WebDriver 已断开: {e}") from e
+        # 普通导航失败但 driver 还活着，退回 UC 重连方式再试一次
+        print(f"   普通导航失败（{e}），退回 uc_open_with_reconnect...", flush=True)
+        try:
+            sb.uc_open_with_reconnect(SERVER_URL, reconnect_time=5)
+        except Exception as e2:
+            if not driver_is_alive(sb) or _looks_like_driver_dead(e2):
+                raise DriverDeadError(f"重连打开服务器面板时 WebDriver 已断开: {e2}") from e2
+            raise
     sb.wait_for_ready_state_complete()
     time.sleep(5)
     handle_cloudflare(sb)
@@ -1053,6 +1102,94 @@ def click_renew(sb):
     return False
 
 
+def _run_attempt(sb, current_ip):
+    """一次完整尝试：登录 → 打开面板 → 保证 Online → 续期 → 回读判定 → TG 通知。
+    流程走完（含按原逻辑判定失败并通知）时正常返回；
+    WebDriver 死亡时抛 DriverDeadError，由 main 销毁会话后用全新会话整体重试。"""
+    global _ACTIVATED_ATTEMPTED
+    _ACTIVATED_ATTEMPTED = False  # 新会话重新允许激活流程执行一遍
+    if not login(sb, EMAIL, PASSWORD):
+        msg = f"❌ 登录失败\nIP: {current_ip}"
+        print(msg, flush=True)
+        send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
+        return
+
+    # 1. 打开服务器面板（包含激活穿透）
+    open_server_panel(sb)
+
+    # 激活流程可能导致浏览器崩溃，检查并重连
+    if not driver_is_alive(sb):
+        print("⚠️ 激活后 WebDriver 连接已断开，尝试重连...", flush=True)
+        if not reconnect_driver(sb):
+            raise DriverDeadError("激活后 WebDriver 断开且重连失败")
+
+    before = read_panel_info(sb)
+    before_time = before.get("remaining")
+    print(f"⏱ 续期前剩余时间: {format_remaining(before_time)}", flush=True)
+
+    # 2. 保证 Online 状态（未启动则自动 Start，休眠则自动激活）
+    started_ok, start_msg = ensure_server_running(sb, before)
+    after_start = read_panel_info(sb)
+
+    if not started_ok:
+        safe_screenshot(sb, "final_result.png")
+        msg = (
+            f"❌ 续期跳过：服务器未 Online\n"
+            f"服务器: {SERVER_ID}\n"
+            f"当前状态: {(after_start.get('status') or 'unknown')}\n"
+            f"启动操作: {start_msg}\n"
+            f"续期前时间: {format_remaining(before_time)}\n"
+            f"IP: {current_ip}"
+        )
+        print(msg, flush=True)
+        send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="final_result.png")
+        return
+
+    # 3. 执行续期
+    print("\n📄 开始续期流程（服务器已 Online）...", flush=True)
+    renew_ok = click_renew(sb)
+
+    print("⏳ 等待续期结果刷新...", flush=True)
+    time.sleep(5)
+    handle_cloudflare(sb)
+    wait_challenge_gone(sb, timeout=15)
+    after = read_panel_info(sb)
+    after_time = after.get("remaining")
+    print(f"⏱ 续期后剩余时间: {format_remaining(after_time)}", flush=True)
+
+    safe_screenshot(sb, "final_result.png")
+
+    before_sec = remaining_to_seconds(before_time)
+    after_sec = remaining_to_seconds(after_time)
+    time_note = "无法对比（有一侧未读到时间）"
+    if before_sec is not None and after_sec is not None:
+        delta = after_sec - before_sec
+        if delta > 30:
+            time_note = f"倒计时已增加约 {delta} 秒，续期生效"
+        elif delta >= -5:
+            time_note = "倒计时变化很小，可能刚续过或尚未刷新"
+        else:
+            time_note = "倒计时未增加，请人工核对截图"
+
+    status_now = after.get("status") or after_start.get("status") or "unknown"
+    lines = [
+        f"{'✅' if renew_ok else '❌'} 续期{'已执行' if renew_ok else '失败'}",
+        f"服务器: {SERVER_ID}",
+        f"当前状态: {status_now}",
+        f"启动操作: {start_msg}",
+        f"续期前时间: {format_remaining(before_time)}",
+        f"续期后时间: {format_remaining(after_time)}",
+        f"结论: {time_note}",
+        f"IP: {current_ip}",
+    ]
+    msg = "\n".join(lines)
+    print("\n" + msg, flush=True)
+    img = "final_result.png" if os.path.exists("final_result.png") else None
+    if not renew_ok and os.path.exists("renew_not_found.png"):
+        img = "renew_not_found.png"
+    send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path=img)
+
+
 def main():
     if not EMAIL or not PASSWORD:
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD", flush=True)
@@ -1070,91 +1207,34 @@ def main():
         sb_kwargs["proxy"] = PROXY_SERVER
         print(f"⚙️ 已启用代理: {PROXY_SERVER}", flush=True)
 
-    with SB(**sb_kwargs) as sb:
-        if not login(sb, EMAIL, PASSWORD):
-            msg = f"❌ 登录失败\nIP: {current_ip}"
-            print(msg, flush=True)
-            send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
-            return
+    last_dead_error = None
+    for attempt in range(1, MAX_SESSION_ATTEMPTS + 1):
+        if attempt > 1:
+            print(f"🔁 第 {attempt}/{MAX_SESSION_ATTEMPTS} 次尝试：重建浏览器会话并重新登录...", flush=True)
+        try:
+            with SB(**sb_kwargs) as sb:
+                try:
+                    _run_attempt(sb, current_ip)
+                except DriverDeadError:
+                    raise
+                except Exception as e:
+                    # 未预期的异常：若 driver 已死亡或异常带连接死亡特征，
+                    # 归类为 DriverDeadError 走会话重建重试；否则保持原行为向上抛出。
+                    if not driver_is_alive(sb) or _looks_like_driver_dead(e):
+                        raise DriverDeadError(f"会话异常且 WebDriver 已断开: {e}") from e
+                    raise
+            last_dead_error = None
+            break
+        except DriverDeadError as e:
+            last_dead_error = e
+            print(f"⚠️ 第 {attempt} 次尝试因 WebDriver 死亡中断: {e}", flush=True)
+            if attempt < MAX_SESSION_ATTEMPTS:
+                time.sleep(5)
 
-        # 1. 打开服务器面板（包含激活穿透）
-        open_server_panel(sb)
-
-        # 激活流程可能导致浏览器崩溃，检查并重连
-        if not driver_is_alive(sb):
-            print("⚠️ 激活后 WebDriver 连接已断开，尝试重连...", flush=True)
-            if not reconnect_driver(sb):
-                safe_screenshot(sb, "driver_crashed.png")
-                msg = f"❌ 浏览器崩溃，无法恢复\n服务器: {SERVER_ID}\nIP: {current_ip}"
-                print(msg, flush=True)
-                send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="after_activate_flow.png")
-                return
-
-        before = read_panel_info(sb)
-        before_time = before.get("remaining")
-        print(f"⏱ 续期前剩余时间: {format_remaining(before_time)}", flush=True)
-
-        # 2. 保证 Online 状态（未启动则自动 Start，休眠则自动激活）
-        started_ok, start_msg = ensure_server_running(sb, before)
-        after_start = read_panel_info(sb)
-
-        if not started_ok:
-            safe_screenshot(sb, "final_result.png")
-            msg = (
-                f"❌ 续期跳过：服务器未 Online\n"
-                f"服务器: {SERVER_ID}\n"
-                f"当前状态: {(after_start.get('status') or 'unknown')}\n"
-                f"启动操作: {start_msg}\n"
-                f"续期前时间: {format_remaining(before_time)}\n"
-                f"IP: {current_ip}"
-            )
-            print(msg, flush=True)
-            send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="final_result.png")
-            return
-
-        # 3. 执行续期
-        print("\n📄 开始续期流程（服务器已 Online）...", flush=True)
-        renew_ok = click_renew(sb)
-
-        print("⏳ 等待续期结果刷新...", flush=True)
-        time.sleep(5)
-        handle_cloudflare(sb)
-        wait_challenge_gone(sb, timeout=15)
-        after = read_panel_info(sb)
-        after_time = after.get("remaining")
-        print(f"⏱ 续期后剩余时间: {format_remaining(after_time)}", flush=True)
-
-        safe_screenshot(sb, "final_result.png")
-
-        before_sec = remaining_to_seconds(before_time)
-        after_sec = remaining_to_seconds(after_time)
-        time_note = "无法对比（有一侧未读到时间）"
-        if before_sec is not None and after_sec is not None:
-            delta = after_sec - before_sec
-            if delta > 30:
-                time_note = f"倒计时已增加约 {delta} 秒，续期生效"
-            elif delta >= -5:
-                time_note = "倒计时变化很小，可能刚续过或尚未刷新"
-            else:
-                time_note = "倒计时未增加，请人工核对截图"
-
-        status_now = after.get("status") or after_start.get("status") or "unknown"
-        lines = [
-            f"{'✅' if renew_ok else '❌'} 续期{'已执行' if renew_ok else '失败'}",
-            f"服务器: {SERVER_ID}",
-            f"当前状态: {status_now}",
-            f"启动操作: {start_msg}",
-            f"续期前时间: {format_remaining(before_time)}",
-            f"续期后时间: {format_remaining(after_time)}",
-            f"结论: {time_note}",
-            f"IP: {current_ip}",
-        ]
-        msg = "\n".join(lines)
-        print("\n" + msg, flush=True)
-        img = "final_result.png" if os.path.exists("final_result.png") else None
-        if not renew_ok and os.path.exists("renew_not_found.png"):
-            img = "renew_not_found.png"
-        send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path=img)
+    if last_dead_error is not None:
+        msg = f"❌ 浏览器多次崩溃，无法恢复\n服务器: {SERVER_ID}\nIP: {current_ip}"
+        print(msg, flush=True)
+        send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
 
     print("🏁 脚本执行完毕", flush=True)
 
