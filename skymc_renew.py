@@ -26,7 +26,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 
 SERVER_URL = os.environ.get("SERVER_URL") or "https://skymc.org/en/server/9W0x2MI79Q9B"
 LOGIN_URL = "https://skymc.org/en/login"
-SERVER_ID = "rUn5c1OR2aLr"
+SERVER_ID = "9W0x2MI79Q9B"
 
 NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
