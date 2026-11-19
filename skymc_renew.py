@@ -24,7 +24,7 @@ PASSWORD = os.environ.get("SKYMC_PASSWORD") or os.environ.get("PASSWORD") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 
-SERVER_URL = os.environ.get("SERVER_URL") or "https://skymc.org/en/server/rUn5c1OR2aLr"
+SERVER_URL = os.environ.get("SERVER_URL") or "https://skymc.org/en/server/9W0x2MI79Q9B"
 LOGIN_URL = "https://skymc.org/en/login"
 SERVER_ID = "rUn5c1OR2aLr"
 
